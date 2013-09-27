@@ -6,6 +6,7 @@ var program = require('commander')
     , moment = require("moment")
     , AWS = require('aws-sdk')
     , async = require("async")
+    , _ = require("underscore")
 
     , STOP_THRESHOLD = 32 * 1024
     ;
@@ -41,51 +42,49 @@ function fetchInstances(region, cb) {
     });
 };
 
-function getNetworkTraffic(region, instanceId, statsKey, sampleHours, cb) {
+function getMedianTraffic(region, instanceId, sampleHours, cb) {
 
-    // i-932578f3
     var cloudwatch = new AWS.CloudWatch({region:region});
 
-    var dimension =  [{Name: 'InstanceId', Value: instanceId}]
+    var dimension =  [{Name: 'InstanceId', Value: instanceId}];
+    var sortFn = function(a, b) { return a.Sum - b.Sum };
+
+    function getDataMedian(metricName, cwCB) {
+        cloudwatch.getMetricStatistics({
+            Namespace: 'AWS/EC2'
+            , MetricName: metricName
+            , Dimensions: dimension
+            , StartTime: moment().subtract('hours', sampleHours+1).toDate()
+            , EndTime : moment().subtract('hours', 1).toDate()
+            , Period : 300
+            , Statistics: [ "Sum" ]
+        }, function(err, data) {
+            if (err) return dataCB(err);
+            if (data.Datapoints.length == 0) return(null, 0);
+
+            var d = _.pluck(data.Datapoints, "Sum");
+            d.sort(sortFn);
+            var middle = Math.floor(d.length / 2);
+            if (d.length % 2 == 0) {
+                return cwCB(null, (d[middle]+d[middle+1])/2)
+            } else {
+                return cwCB(null, d[middle+1]);
+            }
+        });
+    }
 
     async.auto({
-
         /* REQUEST data byte count */
         NetworkOut: function(dataCB) {
-            cloudwatch.getMetricStatistics({
-                Namespace: 'AWS/EC2'
-                , MetricName: 'NetworkOut'
-                , Dimensions: dimension
-                , StartTime: moment().subtract('hours', sampleHours+1).toDate()
-                , EndTime : moment().subtract('hours', 1).toDate()
-                , Period : sampleHours * 3600
-                , Statistics: [ statsKey ]
-            }, function(err, data) {
-                if (err) return dataCB(err);
-                if (data.Datapoints.length == 0) return(null, 0);
-                return dataCB(null, Math.floor(data.Datapoints[0][statsKey]));
-            });
+            getDataMedian('NetworkOut', dataCB);
         },
 
         /* RESPONSE data byte count */
         NetworkIn: function(dataCB) {
-            cloudwatch.getMetricStatistics({
-                Namespace: 'AWS/EC2'
-                , MetricName: 'NetworkIn'
-                , Dimensions: dimension
-                , StartTime: moment().subtract('hours', sampleHours+1).toDate()
-                , EndTime : moment().subtract('hours', 1).toDate()
-                , Period : sampleHours * 3600
-                , Statistics: [ statsKey ]
-            }, function(err, data) {
-                if (err) return dataCB(err);
-                if (data.Datapoints.length == 0) return(null, 0);
-                return dataCB(null, Math.floor(data.Datapoints[0][statsKey]));
-            });
+            getDataMedian('NetworkIn', dataCB);
         }
     }, function(err, results) {
         if (err) return cb(err);
-
         cb(null, results)
     });
 };
@@ -100,39 +99,40 @@ function extractTag(tags, key, defaultValue) {
     return defaultValue;
 }
 
+//getMedianTraffic('us-east-1', 'i-932578f3', 12, console.log.bind(console));
+
 fetchInstances('us-east-1', function(err, instances) {
     if (err) {
         debugErr("Error: %s", err);
         return;
     }
 
-
     var now = moment()
     for(var i=0, l=instances.length; i<l; i++) {
         var instance = instances[i];
         var m = moment(instance.LaunchTime);
         var hours = now.diff(m, 'hours');
+
+        var samplePeriod = 12; // hours
+
         debug("Instance: %s, %s hours", instance.InstanceId, hours);
 
-        if (hours < 12) continue;
+        if (hours < samplePeriod) continue;
 
         (function(instance) {
             //debug("Getting NetworkIn for %s", instance.InstanceId);
-            getNetworkTraffic('us-east-1', instance.InstanceId, 'Sum', 12, function(err, data) {
+            getMedianTraffic('us-east-1', instance.InstanceId, samplePeriod, function(err, data) {
                 if (err) {
-                    debugErr("getNetworkStats Error: %s", err);
+                    debugErr("get traffic Error: %s", err);
                     return;
                 }
 
-                // average data / hr the past 12 hours
-                var avgRequestData = Math.floor(data.NetworkOut / 12)
-                    , avgResponseData = Math.floor(data.NetworkIn / 12) ;
-
-                debug("(%s) %s ==> IN: %s || OUT: %s" 
-                    , instance.InstanceId
-                    , extractTag(instance.Tags, "Name", "") 
-                    , avgRequestData, avgResponseData);
-
+                if (data.NetworkOut < 1024) {
+                    debug("(%s) %s ==> REQ: %s bytes || RES: %s bytes" 
+                        , instance.InstanceId
+                        , extractTag(instance.Tags, "Name", "") 
+                        , data.NetworkOut, data.NetworkIn);
+                }
             });
         }(instance));
     }
