@@ -5,8 +5,9 @@ var program = require('commander')
     , debugErr = require("debug")("reaper:error")
     , moment = require("moment")
     , AWS = require('aws-sdk')
+    , async = require("async")
 
-    , STOP_THRESHOLD = 1024
+    , STOP_THRESHOLD = 32 * 1024
     ;
 
 AWS.config.update({
@@ -40,28 +41,64 @@ function fetchInstances(region, cb) {
     });
 };
 
-function getNetworkIn(region, instanceId, cb) {
+function getNetworkTraffic(region, instanceId, statsKey, sampleHours, cb) {
 
     // i-932578f3
     var cloudwatch = new AWS.CloudWatch({region:region});
 
-    var SAMPLE_HOURS = 12;
+    var dimension =  [{Name: 'InstanceId', Value: instanceId}]
 
-    cloudwatch.getMetricStatistics({
-        Namespace: 'AWS/EC2'
-        , MetricName: 'NetworkOut'
-        , Dimensions: [{Name: 'InstanceId', Value: instanceId}]
-        , StartTime: moment().subtract('hours', SAMPLE_HOURS+1).toDate()
-        , EndTime : moment().subtract('hours', 1).toDate()
-        , Period : SAMPLE_HOURS * 3600
-        , Statistics: ["Average"]
-    }, function(err, data) {
+    async.auto({
+
+        /* REQUEST data byte count */
+        NetworkOut: function(dataCB) {
+            cloudwatch.getMetricStatistics({
+                Namespace: 'AWS/EC2'
+                , MetricName: 'NetworkOut'
+                , Dimensions: dimension
+                , StartTime: moment().subtract('hours', sampleHours+1).toDate()
+                , EndTime : moment().subtract('hours', 1).toDate()
+                , Period : sampleHours * 3600
+                , Statistics: [ statsKey ]
+            }, function(err, data) {
+                if (err) return dataCB(err);
+                if (data.Datapoints.length == 0) return(null, 0);
+                return dataCB(null, Math.floor(data.Datapoints[0][statsKey]));
+            });
+        },
+
+        /* RESPONSE data byte count */
+        NetworkIn: function(dataCB) {
+            cloudwatch.getMetricStatistics({
+                Namespace: 'AWS/EC2'
+                , MetricName: 'NetworkIn'
+                , Dimensions: dimension
+                , StartTime: moment().subtract('hours', sampleHours+1).toDate()
+                , EndTime : moment().subtract('hours', 1).toDate()
+                , Period : sampleHours * 3600
+                , Statistics: [ statsKey ]
+            }, function(err, data) {
+                if (err) return dataCB(err);
+                if (data.Datapoints.length == 0) return(null, 0);
+                return dataCB(null, Math.floor(data.Datapoints[0][statsKey]));
+            });
+        }
+    }, function(err, results) {
         if (err) return cb(err);
 
-        // average bytes / hour for the past 12 hours
-        return cb(null, Math.floor(data.Datapoints[0].Average));
+        cb(null, results)
     });
 };
+
+function extractTag(tags, key, defaultValue) {
+    for(var i=0, l=tags.length; i<l; i++) {
+        if (tags[i].Key == key) {
+            return tags[i].Value;
+        }
+    }
+
+    return defaultValue;
+}
 
 fetchInstances('us-east-1', function(err, instances) {
     if (err) {
@@ -81,15 +118,20 @@ fetchInstances('us-east-1', function(err, instances) {
 
         (function(instance) {
             //debug("Getting NetworkIn for %s", instance.InstanceId);
-            getNetworkIn('us-east-1', instance.InstanceId, function(err, bytes) {
+            getNetworkTraffic('us-east-1', instance.InstanceId, 'Sum', 12, function(err, data) {
                 if (err) {
-                    debugErr("getNetworkIn Error: %s", err);
+                    debugErr("getNetworkStats Error: %s", err);
                     return;
                 }
 
-                if (bytes < STOP_THRESHOLD) {
-                    debug("%s => %s avg bytes/hr", instance.InstanceId, bytes);
-                }
+                // average data / hr the past 12 hours
+                var avgRequestData = Math.floor(data.NetworkOut / 12)
+                    , avgResponseData = Math.floor(data.NetworkIn / 12) ;
+
+                debug("(%s) %s ==> IN: %s || OUT: %s" 
+                    , instance.InstanceId
+                    , extractTag(instance.Tags, "Name", "") 
+                    , avgRequestData, avgResponseData);
 
             });
         }(instance));

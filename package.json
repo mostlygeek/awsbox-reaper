@@ -16,6 +16,7 @@
       , "debug" : "0.7.2"
       , "aws-sdk" : "1.6.0"
       , "moment": "2.2.1"
+      , "async" : "0.2.9"
   },
   "devDependencies": {
   },
