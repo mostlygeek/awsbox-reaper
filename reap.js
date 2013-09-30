@@ -1,33 +1,56 @@
 #!/usr/bin/env node
 
-var program = require('commander')
-    , debug = require("debug")("reaper")
-    , debugErr = require("debug")("reaper:error")
+var program = require("commander")
+    , debug = require("debug")
+    , debugInfo = debug("reaper:info")
+    , debugErr  = debug("reaper:error")
+    , debugSkip = debug("reaper:skip")
+    , debugStop = debug("reaper:stop")
+    , debugTerminate = debug("reaper:terminate")
     , moment = require("moment")
-    , AWS = require('aws-sdk')
+    , AWS = require("aws-sdk")
     , async = require("async")
     , _ = require("underscore")
 
     , STOP_THRESHOLD = 32 * 1024
     ;
 
+program
+    .version('0.0.1')
+    .option('-r, --region [region]', 'AWS region', 'us-east-1')
+    .option('-d, --dryrun', 'Makes real changes to AWS (stop, terminate, etc)', false)
+    .option('-t, --tag [value]', 'search for instances by tag exists', 'AWSBOX')
+    .option('-s, --securitygroup [group-id]', 'search for instances by security group', 'awsbox group v1')
+    .parse(process.argv);
+
+var DRY_RUN = (!!program.dryrun);
+
 AWS.config.update({
     accessKeyId : process.env.AWS_ACCESS_KEY,
     secretAccessKey : process.env.AWS_SECRET_KEY
 });
 
-AWS.config.update({region: 'us-east-1'});
+AWS.config.update({region: program.region});
 
 AWS.config.apiVersions = {
   ec2: '2013-08-15',
   cloudwatch: '2010-08-01'
 };
 
-
 function fetchInstances(region, cb) {
-    debug("Fetching AWSBOXES in %s", region);
+    debugInfo("Fetching AWSBOXES in %s", region);
     var ec2 = new AWS.EC2({region:region});
-    var params = { Filters: [{Name: 'tag-key', Values: ['AWSBOX']}] };
+    // http://docs.aws.amazon.com/AWSEC2/latest/CommandLineReference/ApiReference-cmd-DescribeInstances.html
+
+    if (program.tag) {
+        debugInfo("Searching with tag: %s", program.tag);
+        var params = { Filters: [{Name: 'tag-key', Values: [program.tag]}] };
+    } else if (program.securitygroup) {
+        debugInfo("Searching with security group: %s", program.securitygroup);
+        var params = { Filters: [{Name: 'group-id', Values: [program.securitygroup]}] };
+    } else {
+        var params = {};
+    }
 
     var instances = [];
     ec2.describeInstances(params, function(err, data) {
@@ -37,7 +60,7 @@ function fetchInstances(region, cb) {
             instances = instances.concat(r.Instances);
         }
 
-        debug("Fetched %d instances", instances.length);
+        debugInfo("Fetched %d instances", instances.length);
         cb(null, instances);
     });
 };
@@ -99,11 +122,9 @@ function extractTag(tags, key, defaultValue) {
     return defaultValue;
 }
 
-//getMedianTraffic('us-east-1', 'i-932578f3', 12, console.log.bind(console));
-
-fetchInstances('us-east-1', function(err, instances) {
+fetchInstances(program.region, function(err, instances) {
     if (err) {
-        debugErr("Error: %s", err);
+        debugErr("Fetch Error: %s", err);
         return;
     }
 
@@ -113,25 +134,55 @@ fetchInstances('us-east-1', function(err, instances) {
         var m = moment(instance.LaunchTime);
         var hours = now.diff(m, 'hours');
 
+        instance.HoursOn = hours;
+
         var samplePeriod = 12; // hours
 
-        debug("Instance: %s, %s hours", instance.InstanceId, hours);
+        //debugInfo("Instance: %s, %s hours", instance.InstanceId, hours);
 
         if (hours < samplePeriod) continue;
 
         (function(instance) {
             //debug("Getting NetworkIn for %s", instance.InstanceId);
-            getMedianTraffic('us-east-1', instance.InstanceId, samplePeriod, function(err, data) {
+            getMedianTraffic(program.region, instance.InstanceId, samplePeriod, function(err, data) {
                 if (err) {
                     debugErr("get traffic Error: %s", err);
                     return;
                 }
 
+                // NetworkOut is the median amount of incoming data into the EC2 instance
+                // every 1/2 hour (for the past 12 hours)
                 if (data.NetworkOut < 1024) {
-                    debug("(%s) %s ==> REQ: %s bytes || RES: %s bytes" 
-                        , instance.InstanceId
-                        , extractTag(instance.Tags, "Name", "") 
-                        , data.NetworkOut, data.NetworkIn);
+                    if (extractTag(instance.Tags, 'AWSBOX_SPAREME', false)) {
+                        debugSkip("Sparing instance: %s %s", instance.instanceId, extractTag(instance.Tags, "Name", ""))
+                    } else {
+                        debugStop("%s(%s) (%d hours) %s  ==> REQ: %s bytes || RES: %s bytes" 
+                            , ((DRY_RUN) ? "DRY RUN " : "")
+                            , instance.InstanceId
+                            , instance.HoursOn
+                            , extractTag(instance.Tags, "Name", "") 
+                            , data.NetworkOut, data.NetworkIn);
+
+                        var ec2 = new AWS.EC2({region:program.region});
+
+                        ec2.createTags({
+                            DryRun: DRY_RUN
+                            , Resources: [ instance.InstanceId ]
+                            , Tags: [
+                                {Key: 'AWSBOX_REAP', Value: JSON.stringify({STOP_AT : Date.now()})}
+                            ]
+                        }, function(err, response) {
+                            if (err && err.code != 'DryRunOperation') { debugErr("Tagging Error: %s", err);}
+                        });
+
+                        ec2.stopInstances({
+                            DryRun: DRY_RUN
+                            , InstanceIds: [ instance.InstanceId ]
+                            , Force: false // force the instance to stop w/out opportunity to gracefully shutdown
+                        }, function(err, response) {
+                            if (err && err.code != 'DryRunOperation') { debugErr("STOP Error: %s", err);}
+                        });
+                    }
                 }
             });
         }(instance));
