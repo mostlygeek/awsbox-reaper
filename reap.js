@@ -19,8 +19,8 @@ program
     .version('0.0.1')
     .option('-r, --region [region]', 'AWS region', 'us-east-1')
     .option('-d, --dryrun', 'Makes real changes to AWS (stop, terminate, etc)', false)
-    .option('-t, --tag [value]', 'search for instances by tag exists', 'AWSBOX')
-    .option('-s, --securitygroup [group-id]', 'search for instances by security group', 'awsbox group v1')
+    .option('-t, --tag [value]', 'search for instances by tag exists')
+    .option('-s, --securitygroup [group-id]', 'search for instances by security group')
     .parse(process.argv);
 
 var DRY_RUN = (!!program.dryrun);
