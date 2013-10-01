@@ -42,15 +42,16 @@ function fetchInstances(region, cb) {
     var ec2 = new AWS.EC2({region:region});
     // http://docs.aws.amazon.com/AWSEC2/latest/CommandLineReference/ApiReference-cmd-DescribeInstances.html
 
+    var params = { Filters: [ {Name: "instance-state-name", Values: ["running"]} ]};
+
     if (program.tag) {
         debugInfo("Searching with tag: %s", program.tag);
-        var params = { Filters: [{Name: 'tag-key', Values: [program.tag]}] };
+        params.Filters.push({Name: 'tag-key', Values: [program.tag]});
     } else if (program.securitygroup) {
         debugInfo("Searching with security group: %s", program.securitygroup);
-        var params = { Filters: [{Name: 'group-id', Values: [program.securitygroup]}] };
-    } else {
-        var params = {};
+        params.Filters.push({Name: 'group-id', Values: [program.securitygroup]});
     }
+
 
     var instances = [];
     ec2.describeInstances(params, function(err, data) {
@@ -122,6 +123,16 @@ function extractTag(tags, key, defaultValue) {
     return defaultValue;
 }
 
+function tagExists(tags, key) {
+    for(var i=0, l=tags.length; i<l; i++) {
+        if (tags[i].Key == key) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 fetchInstances(program.region, function(err, instances) {
     if (err) {
         debugErr("Fetch Error: %s", err);
@@ -153,8 +164,8 @@ fetchInstances(program.region, function(err, instances) {
                 // NetworkOut is the median amount of incoming data into the EC2 instance
                 // every 1/2 hour (for the past 12 hours)
                 if (data.NetworkOut < 1024) {
-                    if (extractTag(instance.Tags, 'AWSBOX_SPAREME', false)) {
-                        debugSkip("Sparing instance: %s %s", instance.instanceId, extractTag(instance.Tags, "Name", ""))
+                    if (tagExists(instance.Tags, 'AWSBOX_SPAREME')) {
+                        debugSkip("Sparing instance: %s %s", instance.InstanceId, extractTag(instance.Tags, "Name", ""))
                     } else {
                         debugStop("%s(%s) (%d hours) %s  ==> REQ: %s bytes || RES: %s bytes" 
                             , ((DRY_RUN) ? "DRY RUN " : "")
@@ -165,14 +176,19 @@ fetchInstances(program.region, function(err, instances) {
 
                         var ec2 = new AWS.EC2({region:program.region});
 
+                        var timestamp = moment().format();
                         ec2.createTags({
                             DryRun: DRY_RUN
                             , Resources: [ instance.InstanceId ]
                             , Tags: [
-                                {Key: 'AWSBOX_REAP', Value: JSON.stringify({STOP_AT : Date.now()})}
+                                {Key: 'AWSBOX_REAP', Value: JSON.stringify({STOP_AT : timestamp})}
                             ]
                         }, function(err, response) {
-                            if (err && err.code != 'DryRunOperation') { debugErr("Tagging Error: %s", err);}
+                            if (err && err.code != 'DryRunOperation') { 
+                                debugErr("Tagging Error: %s", err);
+                                return;
+                            }
+                            debugStop("Tagged %s with timestamp %s", instance.InstanceId, timestamp);
                         });
 
                         ec2.stopInstances({
@@ -180,7 +196,12 @@ fetchInstances(program.region, function(err, instances) {
                             , InstanceIds: [ instance.InstanceId ]
                             , Force: false // force the instance to stop w/out opportunity to gracefully shutdown
                         }, function(err, response) {
-                            if (err && err.code != 'DryRunOperation') { debugErr("STOP Error: %s", err);}
+                            if (err && err.code != 'DryRunOperation') { 
+                                debugErr("STOP Error: %s", err);
+                                return;
+                            }
+
+                            debugStop("Stopping: %s", instance.InstanceId);
                         });
                     }
                 }
